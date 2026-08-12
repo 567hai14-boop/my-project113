@@ -12,7 +12,7 @@ const io = new Server(server, {
 });
 
 const TILE_SIZE = 45;
-const CHUNK_SIZE = 16; // bigger chunks = fewer, more varied regenerations, less "same layout" feeling
+const CHUNK_SIZE = 31; // ~30x30 (odd size so the maze carving below has a clean cell grid)
 const generatedChunks = {}; // Lưu map theo key "chunkX_chunkY"
 const players = {};
 const matchmakingQueue = [];
@@ -87,13 +87,170 @@ const addChunkIfMissing = (chunkX, chunkY) => {
 
 const createEmptyGrid = () => Array.from({ length: CHUNK_SIZE }, () => Array(CHUNK_SIZE).fill(1));
 
-const resolveEdgePosition = (side, chunkX, chunkY, salt = 0) => {
-  const edgeIndex = Math.floor(seededRandom(chunkX, chunkY, salt) * (CHUNK_SIZE - 2)) + 1;
-  if (side === 'left') return { x: 0, y: edgeIndex };
-  if (side === 'right') return { x: CHUNK_SIZE - 1, y: edgeIndex };
-  if (side === 'top') return { x: edgeIndex, y: 0 };
-  if (side === 'bottom') return { x: edgeIndex, y: CHUNK_SIZE - 1 };
-  return { x: Math.floor(CHUNK_SIZE / 2), y: Math.floor(CHUNK_SIZE / 2) };
+// Cell grid: only EVEN grid coordinates (0,2,4...) are "cells"; odd
+// coordinates are the walls carved between them. Every chunk edge lands on
+// an even coordinate too (CHUNK_SIZE is odd), so two neighbouring chunks
+// always line up on cell positions and — since every cell is guaranteed
+// open below — the border between chunks is automatically walkable. No
+// extra cross-chunk bookkeeping needed.
+const CELLS_PER_SIDE = Math.floor((CHUNK_SIZE - 1) / 2) + 1; // e.g. 16 for size 31
+
+// Builds a perfect maze (randomized-DFS spanning tree) over the cell grid.
+// A spanning tree touches every single cell exactly once, so by
+// construction there is no unreachable pocket — "không tịt đường" is
+// structurally guaranteed, not just likely.
+const carveSpanningTree = (grid, chunkX, chunkY) => {
+  const visited = Array.from({ length: CELLS_PER_SIDE }, () => Array(CELLS_PER_SIDE).fill(false));
+  const startCx = Math.floor(seededRandom(chunkX, chunkY, 5) * CELLS_PER_SIDE);
+  const startCy = Math.floor(seededRandom(chunkX, chunkY, 7) * CELLS_PER_SIDE);
+  const stack = [[startCx, startCy]];
+  visited[startCy][startCx] = true;
+  grid[startCy * 2][startCx * 2] = 0;
+  let step = 0;
+
+  while (stack.length) {
+    const [cx, cy] = stack[stack.length - 1];
+    const neighbors = [
+      [cx + 1, cy, cx * 2 + 1, cy * 2],
+      [cx - 1, cy, cx * 2 - 1, cy * 2],
+      [cx, cy + 1, cx * 2, cy * 2 + 1],
+      [cx, cy - 1, cx * 2, cy * 2 - 1],
+    ].filter(([nx, ny]) => nx >= 0 && nx < CELLS_PER_SIDE && ny >= 0 && ny < CELLS_PER_SIDE && !visited[ny][nx]);
+
+    if (!neighbors.length) {
+      stack.pop();
+      continue;
+    }
+
+    step += 1;
+    const pickIndex = Math.floor(seededRandom(chunkX, chunkY, step * 131 + cx * 17 + cy * 29) * neighbors.length);
+    const [nx, ny, wallX, wallY] = neighbors[pickIndex];
+    visited[ny][nx] = true;
+    grid[wallY][wallX] = 0; // knock down the wall between the two cells
+    grid[ny * 2][nx * 2] = 0;
+    stack.push([nx, ny]);
+  }
+};
+
+// NOTE: this maze used to "braid" extra loops into the spanning tree so
+// alternate routes existed. That's exactly what made it feel like open
+// space with too few dead ends. It has been removed on purpose — the grid
+// carved by carveSpanningTree() is left as a pure spanning tree (no loops,
+// "không lai nữa"), so every branch that isn't on the route back to the
+// start is a genuine ngõ cụt (dead end).
+
+// BFS every open cell's distance from the chunk's start cell, then collect
+// every dead end (an open cell with exactly one open neighbour) sorted by
+// how far it is from the start. Used to give each chunk 3-4 candidate
+// "farthest" points so a chunk's exit/landmark position can be picked at
+// random per chunk/server instance instead of always the same fixed corner.
+const findFarthestDeadEnds = (grid, startX, startY) => {
+  const dist = Array.from({ length: CHUNK_SIZE }, () => Array(CHUNK_SIZE).fill(-1));
+  const queue = [[startX, startY]];
+  dist[startY][startX] = 0;
+  let qi = 0;
+  while (qi < queue.length) {
+    const [x, y] = queue[qi];
+    qi += 1;
+    const neighbors = [[x + 1, y], [x - 1, y], [x, y + 1], [x, y - 1]];
+    for (const [nx, ny] of neighbors) {
+      if (nx < 0 || nx >= CHUNK_SIZE || ny < 0 || ny >= CHUNK_SIZE) continue;
+      if (grid[ny][nx] !== 0 || dist[ny][nx] !== -1) continue;
+      dist[ny][nx] = dist[y][x] + 1;
+      queue.push([nx, ny]);
+    }
+  }
+
+  const deadEnds = [];
+  for (let y = 0; y < CHUNK_SIZE; y += 1) {
+    for (let x = 0; x < CHUNK_SIZE; x += 1) {
+      if (grid[y][x] !== 0 || dist[y][x] <= 0) continue;
+      let openNeighbors = 0;
+      const neighbors = [[x + 1, y], [x - 1, y], [x, y + 1], [x, y - 1]];
+      for (const [nx, ny] of neighbors) {
+        if (nx < 0 || nx >= CHUNK_SIZE || ny < 0 || ny >= CHUNK_SIZE) continue;
+        if (grid[ny][nx] === 0) openNeighbors += 1;
+      }
+      if (openNeighbors === 1) deadEnds.push({ x, y, dist: dist[y][x] });
+    }
+  }
+
+  deadEnds.sort((a, b) => b.dist - a.dist);
+  return deadEnds.slice(0, 4); // farthest 3-4 dead ends in this chunk
+};
+
+// Places traps on open tiles, but only where a trap doesn't seal off the
+// only remaining route: before committing a trap tile, BFS the graph of
+// still-open (non-trapped) tiles from a fixed reference point and confirm
+// removing this tile keeps everything else reachable. If it doesn't, the
+// tile is a bridge — skip it so the maze never becomes unsolvable.
+const placeTraps = (grid, chunkX, chunkY) => {
+  const traps = [];
+  const blocked = Array.from({ length: CHUNK_SIZE }, () => Array(CHUNK_SIZE).fill(false));
+
+  const countReachable = (fromX, fromY) => {
+    const seen = Array.from({ length: CHUNK_SIZE }, () => Array(CHUNK_SIZE).fill(false));
+    const queue = [[fromX, fromY]];
+    seen[fromY][fromX] = true;
+    let count = 0;
+    while (queue.length) {
+      const [x, y] = queue.pop();
+      count += 1;
+      const neighbors = [[x + 1, y], [x - 1, y], [x, y + 1], [x, y - 1]];
+      for (const [nx, ny] of neighbors) {
+        if (nx < 0 || nx >= CHUNK_SIZE || ny < 0 || ny >= CHUNK_SIZE) continue;
+        if (seen[ny][nx] || grid[ny][nx] !== 0 || blocked[ny][nx]) continue;
+        seen[ny][nx] = true;
+        queue.push([nx, ny]);
+      }
+    }
+    return count;
+  };
+
+  // Reference point + baseline reachable count, computed once before any
+  // traps exist.
+  let refX = -1;
+  let refY = -1;
+  outer:
+  for (let y = 0; y < CHUNK_SIZE; y += 1) {
+    for (let x = 0; x < CHUNK_SIZE; x += 1) {
+      if (grid[y][x] === 0) { refX = x; refY = y; break outer; }
+    }
+  }
+  if (refX === -1) return traps; // shouldn't happen — the spanning tree always opens cell (0,0)
+
+  let baselineReachable = countReachable(refX, refY);
+
+  const distance = Math.sqrt(chunkX * chunkX + chunkY * chunkY);
+  const trapChance = Math.min(0.42, 0.22 + distance * 0.015); // denser further from spawn
+
+  for (let y = 0; y < CHUNK_SIZE; y += 1) {
+    for (let x = 0; x < CHUNK_SIZE; x += 1) {
+      if (grid[y][x] !== 0 || blocked[y][x]) continue;
+      if (x === refX && y === refY) continue;
+      // Keep a little breathing room around already-placed traps so they
+      // read as scattered hazards rather than a solid wall of spikes.
+      const tooClose = [[x + 1, y], [x - 1, y], [x, y + 1], [x, y - 1]]
+        .some(([nx, ny]) => nx >= 0 && nx < CHUNK_SIZE && ny >= 0 && ny < CHUNK_SIZE && blocked[ny][nx]);
+      if (tooClose) continue;
+      if (seededRandom(chunkX + x, chunkY + y, 311) >= trapChance) continue;
+
+      blocked[y][x] = true;
+      const stillReachable = countReachable(refX, refY);
+      if (stillReachable < baselineReachable - 1) {
+        // This tile was a bridge — trapping it would strand another part
+        // of the maze (or force the player through it). Undo and move on.
+        blocked[y][x] = false;
+      } else {
+        baselineReachable = stillReachable;
+        const absX = (chunkX * CHUNK_SIZE + x) * TILE_SIZE;
+        const absY = (chunkY * CHUNK_SIZE + y) * TILE_SIZE;
+        traps.push({ x: absX, y: absY });
+      }
+    }
+  }
+
+  return traps;
 };
 
 const generateChunk = (chunkX, chunkY) => {
@@ -101,122 +258,25 @@ const generateChunk = (chunkX, chunkY) => {
   if (generatedChunks[key]) return generatedChunks[key];
 
   const grid = createEmptyGrid();
-  const traps = [];
-  const distance = Math.sqrt(chunkX * chunkX + chunkY * chunkY);
-  const openness = Math.min(0.7, 0.12 + distance * 0.04);
+  carveSpanningTree(grid, chunkX, chunkY); // guarantees full connectivity, pure tree — lots of dead ends
+  const traps = placeTraps(grid, chunkX, chunkY); // guaranteed not to block the only path
 
-  // "Chuột đào hang": several random walkers dig winding tunnels through the
-  // chunk instead of one fixed mid-cross + straight branches, so chunks stop
-  // feeling like the same template repeating. Each walker avoids reversing
-  // on itself immediately (that's what made corridors feel like dead-end
-  // backtracks) and occasionally widens its tunnel by a tile.
-  const diggerCount = 6 + Math.floor(seededRandom(chunkX, chunkY, 3) * 4); // 6-9 diggers
-  for (let digger = 0; digger < diggerCount; digger += 1) {
-    let x = Math.floor(seededRandom(chunkX, chunkY, digger * 7 + 1) * CHUNK_SIZE);
-    let y = Math.floor(seededRandom(chunkX, chunkY, digger * 13 + 1) * CHUNK_SIZE);
-    const length = Math.max(10, Math.floor(14 + seededRandom(chunkX, chunkY, digger * 11 + 1) * 22));
-    let lastDir = -1;
-    const oppositeOf = { 0: 1, 1: 0, 2: 3, 3: 2 };
-
-    for (let step = 0; step < length; step += 1) {
-      grid[y][x] = 0;
-      // widen some tunnels so they don't all read as identical 1-tile corridors
-      if (seededRandom(chunkX + x, chunkY + y, digger * 5 + step) < 0.3) {
-        if (x + 1 < CHUNK_SIZE) grid[y][x + 1] = 0;
-        if (y + 1 < CHUNK_SIZE) grid[y + 1][x] = 0;
-      }
-
-      let direction = Math.floor(seededRandom(chunkX, chunkY, digger * 23 + step * 3) * 4);
-      if (direction === oppositeOf[lastDir] && seededRandom(chunkX, chunkY, digger * 29 + step) < 0.8) {
-        direction = (direction + 1) % 4;
-      }
-      lastDir = direction;
-
-      if (direction === 0 && x < CHUNK_SIZE - 1) x += 1;
-      else if (direction === 1 && x > 0) x -= 1;
-      else if (direction === 2 && y < CHUNK_SIZE - 1) y += 1;
-      else if (direction === 3 && y > 0) y -= 1;
-      grid[y][x] = 0;
-    }
+  // 3-4 farthest dead ends in this chunk, computed once and picked from at
+  // random (per chunk, seeded — so every server/world instance still gets
+  // a different but reproducible pick, no two chunks "lai" the same spot).
+  const farthestDeadEnds = findFarthestDeadEnds(grid, 0, 0);
+  let exitX = (CELLS_PER_SIDE - 1) * 2;
+  let exitY = (CELLS_PER_SIDE - 1) * 2;
+  if (farthestDeadEnds.length) {
+    const pickIndex = Math.min(
+      farthestDeadEnds.length - 1,
+      Math.floor(seededRandom(chunkX, chunkY, 919) * farthestDeadEnds.length)
+    );
+    exitX = farthestDeadEnds[pickIndex].x;
+    exitY = farthestDeadEnds[pickIndex].y;
   }
 
-  const sideKeys = ['left', 'top', 'right', 'bottom'];
-  const entrySide = sideKeys[Math.floor(seededRandom(chunkX, chunkY, 31) * sideKeys.length)];
-  const exitSide = sideKeys[Math.floor(seededRandom(chunkX, chunkY, 37) * sideKeys.length)];
-  const entryPos = resolveEdgePosition(entrySide, chunkX, chunkY, 41);
-  const exitPos = resolveEdgePosition(exitSide, chunkX, chunkY, 43);
-  grid[entryPos.y][entryPos.x] = 0;
-  grid[exitPos.y][exitPos.x] = 0;
-
-  const carveCorridor = (start, end, seedOffset) => {
-    let cx = start.x;
-    let cy = start.y;
-    while (cx !== end.x || cy !== end.y) {
-      grid[cy][cx] = 0;
-      const dx = end.x - cx;
-      const dy = end.y - cy;
-      const choice = seededRandom(chunkX, chunkY, seedOffset + cx + cy);
-      if (Math.abs(dx) > Math.abs(dy)) cx += dx > 0 ? 1 : -1;
-      else cy += dy > 0 ? 1 : -1;
-      if (choice > 0.4 && Math.abs(dx) > 0 && Math.abs(dy) > 0) {
-        if (choice < 0.7) cy += dy > 0 ? 1 : -1;
-        else cx += dx > 0 ? 1 : -1;
-      }
-      cx = clamp(cx, 0, CHUNK_SIZE - 1);
-      cy = clamp(cy, 0, CHUNK_SIZE - 1);
-      grid[cy][cx] = 0;
-    }
-  };
-
-  carveCorridor(entryPos, exitPos, 53);
-
-  for (let y = 0; y < CHUNK_SIZE; y += 1) {
-    for (let x = 0; x < CHUNK_SIZE; x += 1) {
-      if (grid[y][x] === 1) {
-        const noise = seededRandom(chunkX, chunkY, x * 17 + y * 31);
-        if (noise < openness * 0.2) grid[y][x] = 0;
-      }
-    }
-  }
-
-  for (let y = 1; y < CHUNK_SIZE - 1; y += 1) {
-    for (let x = 1; x < CHUNK_SIZE - 1; x += 1) {
-      if (grid[y][x] === 1) {
-        if (grid[y + 1][x] === 0 || grid[y - 1][x] === 0 || grid[y][x + 1] === 0 || grid[y][x - 1] === 0) {
-          if (seededRandom(chunkX + x, chunkY + y, 99) < 0.12) {
-            const absX = (chunkX * CHUNK_SIZE + x) * TILE_SIZE;
-            const absY = (chunkY * CHUNK_SIZE + y) * TILE_SIZE;
-            traps.push({ x: absX, y: absY });
-          }
-        }
-      }
-    }
-  }
-
-  // Braid pass: any path tile with exactly one open neighbour is a dead
-  // end. Carve one more neighbour open so exploring doesn't constantly run
-  // into cul-de-sacs — this is what makes the tunnels feel connected rather
-  // than a maze of isolated pockets.
-  for (let y = 1; y < CHUNK_SIZE - 1; y += 1) {
-    for (let x = 1; x < CHUNK_SIZE - 1; x += 1) {
-      if (grid[y][x] !== 0) continue;
-      const openNeighbors = [
-        [x + 1, y], [x - 1, y], [x, y + 1], [x, y - 1],
-      ].filter(([nx, ny]) => grid[ny][nx] === 0);
-      if (openNeighbors.length === 1 && seededRandom(chunkX + x, chunkY + y, 77) < 0.7) {
-        const candidates = [
-          [x + 1, y], [x - 1, y], [x, y + 1], [x, y - 1],
-        ].filter(([nx, ny]) => nx > 0 && nx < CHUNK_SIZE - 1 && ny > 0 && ny < CHUNK_SIZE - 1);
-        if (candidates.length) {
-          const pickIndex = Math.floor(seededRandom(chunkX + x, chunkY + y, 83) * candidates.length);
-          const [px, py] = candidates[pickIndex];
-          grid[py][px] = 0;
-        }
-      }
-    }
-  }
-
-  const chunk = { grid, traps, entryX: entryPos.x, entryY: entryPos.y, exitX: exitPos.x, exitY: exitPos.y };
+  const chunk = { grid, traps, entryX: 0, entryY: 0, exitX, exitY, farthestDeadEnds };
   generatedChunks[key] = chunk;
   return chunk;
 };
@@ -402,8 +462,6 @@ const updateBotPath = (room, target) => {
 
 const moveBotAlongPath = (room, target) => {
   const bot = room.bot;
-  const botTile = { x: Math.floor(bot.x / TILE_SIZE), y: Math.floor(bot.y / TILE_SIZE) };
-  const playerTile = { x: Math.floor(target.x / TILE_SIZE), y: Math.floor(target.y / TILE_SIZE) };
   const path = updateBotPath(room, target);
   if (!path.length || path.length < 2) {
     return;
@@ -425,6 +483,51 @@ const moveBotAlongPath = (room, target) => {
   bot.x += dx * ratio;
   bot.y += dy * ratio;
 };
+
+// Instead of A*-cutting straight toward the player's *current* spot, the bot
+// retraces the exact tiles the player has already walked, in order — like
+// following footprints. Each room.bot.followIndexByPlayer[id] is how far
+// along that player's trail the bot has walked to so far. If a player
+// hasn't left enough of a trail yet (start of the run, or the bot just
+// switched target), we fall back to moveBotAlongPath's A* chase so the bot
+// isn't stuck standing still.
+const moveBotAlongPlayerTrail = (room, target) => {
+  const bot = room.bot;
+  const trail = target.trail || [];
+
+  if (trail.length < 2) {
+    moveBotAlongPath(room, target);
+    return;
+  }
+
+  if (!room.bot.followIndexByPlayer) room.bot.followIndexByPlayer = {};
+  let idx = room.bot.followIndexByPlayer[target.id] || 0;
+  if (idx >= trail.length) idx = trail.length - 1;
+
+  const nextTile = trail[idx];
+  const targetX = nextTile.x * TILE_SIZE;
+  const targetY = nextTile.y * TILE_SIZE;
+  const dx = targetX - bot.x;
+  const dy = targetY - bot.y;
+  const distance = Math.hypot(dx, dy);
+
+  if (distance <= bot.speed || distance === 0) {
+    bot.x = targetX;
+    bot.y = targetY;
+    idx = Math.min(idx + 1, trail.length - 1);
+  } else {
+    const ratio = bot.speed / distance;
+    bot.x += dx * ratio;
+    bot.y += dy * ratio;
+  }
+
+  room.bot.followIndexByPlayer[target.id] = idx;
+};
+
+// Bot speed ramp: +3% (compounding) every second the match has been live,
+// capped at 1.6x whatever the chased player's own current speed is.
+const BOT_SPEED_RAMP_PER_SECOND = 0.03;
+const BOT_MAX_SPEED_MULTIPLIER = 1.6;
 
 const startRoomBotLoop = (roomId) => {
   if (!rooms[roomId]) return;
@@ -448,13 +551,18 @@ const startRoomBotLoop = (roomId) => {
       }
     }
 
-    const elapsed = Date.now() - room.createdAt;
-    const boostSteps = Math.floor(elapsed / 10000);
-    const maxSpeed = (target.speed || 4) * 1.12;
-    const baseSpeed = 3.5 * Math.pow(1.03, boostSteps);
+    // Bot speed ramps up by a fixed percentage every second the match has
+    // been running (measured from when the countdown ended, not from room
+    // creation, so waiting in the lobby/countdown never counts against the
+    // player). Compounding 1.03^seconds means: 1s -> +3%, 10s -> +34%,
+    // 30s -> +142%, capped so it can never wildly outrun the player.
+    const elapsed = Date.now() - (room.startedAt || room.createdAt);
+    const secondsElapsed = Math.floor(elapsed / 1000);
+    const maxSpeed = (target.speed || 4) * BOT_MAX_SPEED_MULTIPLIER;
+    const baseSpeed = 3.5 * Math.pow(1 + BOT_SPEED_RAMP_PER_SECOND, secondsElapsed);
     room.bot.speed = Math.min(baseSpeed, maxSpeed);
 
-    moveBotAlongPath(room, target);
+    moveBotAlongPlayerTrail(room, target);
   }, 100);
 };
 
@@ -719,6 +827,7 @@ io.on('connection', (socket) => {
     player.x = (CHUNK_SIZE * TILE_SIZE) / 2;
     player.y = (CHUNK_SIZE * TILE_SIZE) / 2;
     player.distance = 0;
+    player.trail = []; // fresh spawn — old trail would point at the previous run's maze
 
     for (let cx = -1; cx <= 1; cx += 1) {
       for (let cy = -1; cy <= 1; cy += 1) {
@@ -756,6 +865,7 @@ io.on('connection', (socket) => {
       speed: 4,
       distance: 0,
       roomId: null,
+      trail: [],
     };
     players[socket.id].name = data.name || players[socket.id].name;
 
@@ -803,6 +913,7 @@ io.on('connection', (socket) => {
       speed: 4,
       distance: 0,
       roomId: null,
+      trail: [],
     };
     players[socket.id].name = data.username;
 
@@ -937,6 +1048,19 @@ io.on('connection', (socket) => {
       player.x = nextX;
       player.y = nextY;
       player.distance = getPlayerDistance(player);
+
+      // Record the tile the player just entered so the bot can retrace the
+      // exact route later (see moveBotAlongPlayerTrail). Only append on an
+      // actual tile change, not every 60Hz tick, so the trail stays a clean
+      // list of distinct stepping stones instead of thousands of duplicates.
+      if (!player.trail) player.trail = [];
+      const lastStep = player.trail[player.trail.length - 1];
+      if (!lastStep || lastStep.x !== tileX || lastStep.y !== tileY) {
+        player.trail.push({ x: tileX, y: tileY });
+        // Safety cap — a 2-minute match at normal speed leaves a trail far
+        // shorter than this, but this keeps memory bounded either way.
+        if (player.trail.length > 4000) player.trail.shift();
+      }
     }
 
     if (player.roomId) sendRoomGameUpdate(player.roomId);
