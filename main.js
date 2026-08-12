@@ -51,7 +51,7 @@
 
   // Configs (must match server)
   const TILE_SIZE = 45;
-  const CHUNK_SIZE = 16; // must match server's CHUNK_SIZE
+  const CHUNK_SIZE = 31; // must match server's CHUNK_SIZE
   const MOVE_SPEED = 4; // px per server tick — must match server's player.speed
 
   // Client-side prediction: we move this locally every animation frame using
@@ -691,19 +691,29 @@
       // the maze around you instead of a tiny cut-out hole.
       const centerX = width / 2;
       const centerY = height / 2;
-      const clearRadius = 340; // fully visible radius, in screen pixels
-      const fadeRadius = 480;  // fog fully opaque again beyond this
+      // Small, sharply-lit core right around the player, then a long soft
+      // taper out to solid fog — a torch-light well, not a big flat clear
+      // disc. The whole map starts basically black; only this well reveals
+      // anything, and it gets murkier the further from center you look.
+      const coreRadius = 130;  // fully lit radius, in screen pixels
+      const fadeRadius = 360;  // fully opaque fog again beyond this
 
-      ctx.fillStyle = 'rgba(3,8,12,0.92)';
+      // Base layer: near-solid fog everywhere. Kept just shy of fully
+      // opaque (0.985) instead of 1.0 so there is zero readable detail
+      // beneath it, but the composite math below still has something to
+      // punch a hole through.
+      ctx.fillStyle = 'rgba(2,5,8,0.985)';
       ctx.fillRect(0, 0, width, height);
 
       ctx.globalCompositeOperation = 'destination-out';
       const fogGradient = ctx.createRadialGradient(
-        centerX, centerY, clearRadius * 0.35,
+        centerX, centerY, 0,
         centerX, centerY, fadeRadius
       );
       fogGradient.addColorStop(0, 'rgba(255,255,255,1)');
-      fogGradient.addColorStop(0.55, 'rgba(255,255,255,0.85)');
+      fogGradient.addColorStop(coreRadius / fadeRadius, 'rgba(255,255,255,1)');
+      fogGradient.addColorStop(0.72, 'rgba(255,255,255,0.55)');
+      fogGradient.addColorStop(0.9, 'rgba(255,255,255,0.15)');
       fogGradient.addColorStop(1, 'rgba(255,255,255,0)');
       ctx.fillStyle = fogGradient;
       ctx.beginPath();
@@ -720,7 +730,7 @@
         const realX = width / 2 + (botScreenPos.x - width / 2) * ZOOM;
         const realY = height / 2 + (botScreenPos.y - height / 2) * ZOOM;
         const distToBot = Math.hypot(realX - centerX, realY - centerY);
-        if (distToBot > clearRadius * 0.9) {
+        if (distToBot > coreRadius * 0.9) {
           drawEdgeIndicator(centerX, centerY, realX, realY, width, height, '#ff3333');
         }
       }
