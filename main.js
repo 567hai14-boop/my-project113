@@ -24,6 +24,7 @@
   const hudOverlay = document.getElementById('hudOverlay');
   const statusPlayer = document.getElementById('statusPlayer');
   const statusOpponent = document.getElementById('statusOpponent');
+  const statusTimer = document.getElementById('statusTimer');
   const canvas = document.getElementById('gameCanvas');
   const ctx = canvas.getContext('2d');
 
@@ -50,7 +51,7 @@
 
   // Configs (must match server)
   const TILE_SIZE = 45;
-  const CHUNK_SIZE = 10;
+  const CHUNK_SIZE = 16; // must match server's CHUNK_SIZE
   const MOVE_SPEED = 4; // px per server tick — must match server's player.speed
 
   // Client-side prediction: we move this locally every animation frame using
@@ -112,7 +113,9 @@
 
   const renderWaitingRooms = () => {
     waitingRoomList.innerHTML = '';
-    state.publicRooms.forEach((room) => {
+    state.publicRooms
+      .filter((room) => room.host !== state.username)
+      .forEach((room) => {
       const item = document.createElement('button');
       item.className = 'waiting-item';
       item.textContent = `${room.host} đang chờ đấu`;
@@ -227,10 +230,37 @@
   socket.on('room_list_update', (rooms) => { state.publicRooms = rooms; renderWaitingRooms(); });
   socket.on('public_room_created', (data) => { state.publicRooms = data.activeRooms; renderWaitingRooms(); });
 
+  // PvP match countdown timer (~2 phút). Purely a client-side display —
+  // the server enforces the real time limit and decides the outcome, this
+  // just shows the player how much time is left.
+  let matchTimerInterval = null;
+  let matchEndAt = null;
+
+  const updateTimerDisplay = () => {
+    if (!matchEndAt) return;
+    const remainMs = Math.max(0, matchEndAt - Date.now());
+    const totalSec = Math.ceil(remainMs / 1000);
+    const m = Math.floor(totalSec / 60);
+    const s = totalSec % 60;
+    statusTimer.textContent = `⏱ ${m}:${String(s).padStart(2, '0')}`;
+    if (remainMs <= 0 && matchTimerInterval) {
+      clearInterval(matchTimerInterval);
+      matchTimerInterval = null;
+    }
+  };
+
+  const stopMatchTimer = () => {
+    if (matchTimerInterval) { clearInterval(matchTimerInterval); matchTimerInterval = null; }
+    matchEndAt = null;
+    statusTimer.classList.add('hidden');
+  };
+
   socket.on('match_start', (data) => {
     hudOverlay.textContent = '3';
     showScreen('game');
     predicted = null;
+    inputLocked = true;
+    keysPressed.up = keysPressed.down = keysPressed.left = keysPressed.right = false;
     let count = 3;
     const countdown = setInterval(() => {
       count -= 1;
@@ -248,9 +278,22 @@
     } else {
       statusOpponent.classList.add('hidden');
     }
+
+    if (matchTimerInterval) { clearInterval(matchTimerInterval); matchTimerInterval = null; }
+    if (data.timeLimitMs) {
+      matchEndAt = Date.now() + data.timeLimitMs;
+      statusTimer.classList.remove('hidden');
+      updateTimerDisplay();
+      matchTimerInterval = setInterval(updateTimerDisplay, 250);
+    } else {
+      stopMatchTimer();
+    }
   });
 
-  socket.on('match_countdown', (count) => { hudOverlay.textContent = count > 0 ? String(count) : 'BẮT ĐẦU!'; });
+  socket.on('match_countdown', (count) => {
+    hudOverlay.textContent = count > 0 ? String(count) : 'BẮT ĐẦU!';
+    if (count <= 0) inputLocked = false;
+  });
 
   // Game update arrives
   socket.on('game_update', (update) => {
@@ -283,6 +326,7 @@
   socket.on('player_died', (payload) => {
     // Hide game screen and show result overlay
     gameScreen.classList.add('hidden');
+    stopMatchTimer();
 
     const amLoser = payload?.loserId === socket.id;
     const finalMs = payload?.finalTime ?? 0;
@@ -300,13 +344,22 @@
     overlay.style.background = 'rgba(0,0,0,0.6)';
     overlay.style.zIndex = '9999';
 
+    const timeUp = payload?.reason === 'time_up';
     const box = document.createElement('div');
     box.className = 'result-overlay-box';
-    box.innerHTML = amLoser
-      ? `<div style="font-size:20px">💀 SYSTEM FAILURE - BẠN ĐÃ BỊ HỦY DIỆT</div>
-         <div style="margin-top:12px;font-weight:800">SURVIVED: ${seconds}s</div>`
-      : `<div style="font-size:20px">🏆 CHIẾN THẮNG - ĐỐI THỦ ĐÃ BỊ HẠ GỤC</div>
-         <div style="margin-top:12px;font-weight:800">THỜI GIAN: ${seconds}s</div>`;
+    if (timeUp) {
+      box.innerHTML = amLoser
+        ? `<div style="font-size:20px">⏱ HẾT GIỜ - BẠN CHẠY ĐƯỢC QUÃNG ĐƯỜNG NGẮN HƠN</div>
+           <div style="margin-top:12px;font-weight:800">THỜI GIAN: ${seconds}s</div>`
+        : `<div style="font-size:20px">🏆 HẾT GIỜ - BẠN CHẠY XA HƠN ĐỐI THỦ</div>
+           <div style="margin-top:12px;font-weight:800">THỜI GIAN: ${seconds}s</div>`;
+    } else {
+      box.innerHTML = amLoser
+        ? `<div style="font-size:20px">💀 SYSTEM FAILURE - BẠN ĐÃ BỊ HỦY DIỆT</div>
+           <div style="margin-top:12px;font-weight:800">SURVIVED: ${seconds}s</div>`
+        : `<div style="font-size:20px">🏆 CHIẾN THẮNG - ĐỐI THỦ ĐÃ BỊ HẠ GỤC</div>
+           <div style="margin-top:12px;font-weight:800">THỜI GIAN: ${seconds}s</div>`;
+    }
 
     const retryBtn = document.createElement('div');
     retryBtn.className = 'result-button';
@@ -330,6 +383,7 @@
   // sends this, but the client never listened for it before, leaving the
   // remaining player stuck on the game screen indefinitely.
   socket.on('match_cancelled', (payload) => {
+    stopMatchTimer();
     predicted = null;
     state.match = null;
     hudOverlay.textContent = '';
@@ -339,6 +393,9 @@
 
   // Movement input handling (keyboard and touch). Emit at ~60Hz.
   const keysPressed = { up: false, down: false, left: false, right: false };
+  // Frozen during the 3-2-1 countdown so nobody can sneak a head start —
+  // unlocked once the server's own countdown reaches 0.
+  let inputLocked = true;
   const keyMap = {
     ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right',
     w: 'up', s: 'down', a: 'left', d: 'right',
@@ -356,6 +413,7 @@
 
   // Emit movement 60Hz
   setInterval(() => {
+    if (inputLocked) return;
     socket.emit('player_move', keysPressed);
   }, 1000 / 60);
 
@@ -368,6 +426,7 @@
   }, { passive: true });
 
   canvas.addEventListener('touchend', (ev) => {
+    if (inputLocked) return;
     const t = ev.changedTouches[0];
     const dx = t.clientX - touchStartX;
     const dy = t.clientY - touchStartY;
@@ -433,16 +492,27 @@
 
   function drawPseudo3DWalls(sx, sy, size) {
     // sx,sy top-left on screen
-    // base wall
-    ctx.fillStyle = '#334155'; // slate
+    // base wall — deep navy so the neon edges pop against it
+    ctx.fillStyle = '#0c1622';
     ctx.fillRect(sx, sy, size, size);
-    // neon cyan thin top border
-    ctx.strokeStyle = '#00f0ff';
+
+    // glowing neon outline (teal), softly lit
+    ctx.save();
+    ctx.shadowBlur = 10;
+    ctx.shadowColor = '#3ee6c4';
+    ctx.strokeStyle = '#3ee6c4';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(sx + 1.5, sy + 1.5, size - 3, size - 3);
+    ctx.restore();
+
+    // brighter purple top edge for a pseudo-3D lit-from-above look
+    ctx.strokeStyle = '#b9a9ff';
     ctx.lineWidth = 2;
     ctx.beginPath();
     ctx.moveTo(sx + 0.5, sy + 1);
     ctx.lineTo(sx + size - 0.5, sy + 1);
     ctx.stroke();
+
     // heavy black bottom shadow to create depth
     ctx.fillStyle = '#000';
     ctx.fillRect(sx, sy + size - 3, size, 3);
@@ -499,6 +569,12 @@
     while (ghostTrail.length && ghostTrail[ghostTrail.length - 1].alpha <= 0.01) ghostTrail.pop();
   }
 
+  // How much bigger every tile/entity renders. Zooming in makes the maze
+  // easier to read; we compensate by pushing the fog's clear radius out
+  // further (in screen pixels) so the *world* distance you can see doesn't
+  // shrink — it actually ends up larger than before.
+  const ZOOM = 1.35;
+
   function drawScene() {
     const width = canvas.clientWidth;
     const height = canvas.clientHeight;
@@ -515,6 +591,17 @@
     const youPos = getYouPos();
     const camX = youPos ? youPos.x - width / 2 : 0;
     const camY = youPos ? youPos.y - height / 2 : 0;
+
+    let botScreenPos = null; // filled inside the zoomed block, used by the fog/indicator below
+
+    // Everything world-related is drawn inside this zoom transform, scaled
+    // around the exact screen center — since the camera always keeps the
+    // player at screen center too, the player stays put and everything
+    // around them simply renders bigger.
+    ctx.save();
+    ctx.translate(width / 2, height / 2);
+    ctx.scale(ZOOM, ZOOM);
+    ctx.translate(-width / 2, -height / 2);
 
     // Draw chunks -> tiles
     if (Array.isArray(gameState.chunks)) {
@@ -558,11 +645,12 @@
     if (gameState.bot) {
       const bx = gameState.bot.x - camX;
       const by = gameState.bot.y - camY;
+      botScreenPos = { x: bx + 17, y: by + 17 };
       ctx.save();
-      ctx.shadowBlur = 18;
+      ctx.shadowBlur = 26;
       ctx.shadowColor = '#ff3333';
       ctx.fillStyle = '#ff3333';
-      ctx.strokeStyle = '#000';
+      ctx.strokeStyle = '#ffb3b3';
       ctx.lineWidth = 2;
       ctx.fillRect(bx, by, 34, 34);
       ctx.strokeRect(bx, by, 34, 34);
@@ -592,22 +680,82 @@
       ctx.lineWidth = 2;
       ctx.fillRect(px, py, 32, 32);
       ctx.strokeRect(px, py, 32, 32);
+    }
 
-      // Fog of war / radial mask
-      const centerX = px + 16;
-      const centerY = py + 16;
-      const radius = 150;
-      // darken whole screen and cut a hole at player
-      ctx.fillStyle = 'rgba(3,8,12,0.9)';
+    ctx.restore(); // pop the zoom transform — fog + UI below are drawn at real screen scale
+
+    if (youPos) {
+      // Fog of war — the player is always exactly at screen center (that's
+      // how the camera works), so the fog center never needs camera math.
+      // Wider, soft-edged radius so you can actually see a decent chunk of
+      // the maze around you instead of a tiny cut-out hole.
+      const centerX = width / 2;
+      const centerY = height / 2;
+      const clearRadius = 340; // fully visible radius, in screen pixels
+      const fadeRadius = 480;  // fog fully opaque again beyond this
+
+      ctx.fillStyle = 'rgba(3,8,12,0.92)';
       ctx.fillRect(0, 0, width, height);
+
       ctx.globalCompositeOperation = 'destination-out';
+      const fogGradient = ctx.createRadialGradient(
+        centerX, centerY, clearRadius * 0.35,
+        centerX, centerY, fadeRadius
+      );
+      fogGradient.addColorStop(0, 'rgba(255,255,255,1)');
+      fogGradient.addColorStop(0.55, 'rgba(255,255,255,0.85)');
+      fogGradient.addColorStop(1, 'rgba(255,255,255,0)');
+      ctx.fillStyle = fogGradient;
       ctx.beginPath();
-      ctx.arc(centerX, centerY, radius, 0, Math.PI * 2);
+      ctx.arc(centerX, centerY, fadeRadius, 0, Math.PI * 2);
       ctx.fill();
       ctx.globalCompositeOperation = 'source-over';
+
+      // Bot direction indicator — the bot itself gets hidden by the fog once
+      // it's far away, so without this the player has no idea it's chasing
+      // them at all. Draw a glowing arrow at the screen edge pointing at it.
+      // botScreenPos was captured pre-zoom, so convert it to real screen
+      // space the same way the zoom transform does (scaled around center).
+      if (botScreenPos) {
+        const realX = width / 2 + (botScreenPos.x - width / 2) * ZOOM;
+        const realY = height / 2 + (botScreenPos.y - height / 2) * ZOOM;
+        const distToBot = Math.hypot(realX - centerX, realY - centerY);
+        if (distToBot > clearRadius * 0.9) {
+          drawEdgeIndicator(centerX, centerY, realX, realY, width, height, '#ff3333');
+        }
+      }
     }
 
     // Optional: UI overlays drawn by DOM, so we skip drawing HUD here
+  }
+
+  // Draws a small glowing triangle at the edge of the screen, rotated to
+  // point from (fromX, fromY) towards (toX, toY) — used so off-screen/fogged
+  // threats (the chasing bot) still give the player a sense of direction.
+  function drawEdgeIndicator(fromX, fromY, toX, toY, width, height, color) {
+    const angle = Math.atan2(toY - fromY, toX - fromX);
+    const margin = 46;
+    const halfW = width / 2 - margin;
+    const halfH = height / 2 - margin;
+    const cos = Math.cos(angle) || 1e-6;
+    const sin = Math.sin(angle) || 1e-6;
+    const t = Math.min(Math.abs(halfW / cos), Math.abs(halfH / sin));
+    const ex = width / 2 + cos * t;
+    const ey = height / 2 + sin * t;
+
+    ctx.save();
+    ctx.translate(ex, ey);
+    ctx.rotate(angle);
+    ctx.shadowBlur = 14;
+    ctx.shadowColor = color;
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.moveTo(12, 0);
+    ctx.lineTo(-9, -8);
+    ctx.lineTo(-9, 8);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
   }
 
   // Move the predicted position locally, using the same "check the final
@@ -619,6 +767,7 @@
     if (lastFrameTime === null) { lastFrameTime = now; return; }
     const dtMs = now - lastFrameTime;
     lastFrameTime = now;
+    if (inputLocked) return; // frozen during the 3-2-1 countdown
     // Scale to a 60Hz baseline so movement speed doesn't depend on refresh rate
     const speed = MOVE_SPEED * (dtMs / (1000 / 60));
 
