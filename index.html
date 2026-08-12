@@ -1,0 +1,98 @@
+﻿<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Maze PK Retro</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <main>
+    <section id="loginScreen" class="screen login-screen">
+      <div class="retro-box">
+        <div class="brand">
+          <span class="brand-mark">◆</span>
+          <h1>MAZE<em>RETRO</em></h1>
+        </div>
+        <p class="brand-tagline">Chạy nhanh hơn. Sống sót lâu hơn.</p>
+        <div class="field-group">
+          <label for="usernameInput">Tên tài khoản</label>
+          <input id="usernameInput" type="text" placeholder="Nhập tên..." autocomplete="username" />
+        </div>
+        <div class="field-group">
+          <label for="passwordInput">Mật khẩu</label>
+          <input id="passwordInput" type="password" placeholder="Nhập mật khẩu..." autocomplete="current-password" />
+        </div>
+        <button id="loginButton" class="retro-button">KHỞI ĐỘNG KẾT NỐI</button>
+        <p id="loginStatus" class="login-status hidden"></p>
+      </div>
+    </section>
+
+    <section id="lobbyScreen" class="screen hidden lobby-screen">
+      <div class="lobby-grid">
+        <article class="panel left">
+          <div class="panel-title">NGƯỜI CHƠI</div>
+          <div class="account-card">
+            <div class="account-name" id="displayName">Chưa đăng nhập</div>
+            <div class="account-wins" id="winCount">0 trận thắng</div>
+          </div>
+          <div class="tile-grid">
+            <button class="square-btn" id="singleModeBtn">▶<span>Đơn</span></button>
+            <button class="square-btn" id="pvpModeBtn">⚔️<span>PvP</span></button>
+            <button class="square-btn" disabled>🔒<span>Khóa</span></button>
+            <button class="square-btn" disabled>⚙️<span>Cài đặt</span></button>
+          </div>
+        </article>
+
+        <article class="panel center">
+          <div class="panel-title">BẢNG XẾP HẠNG</div>
+          <div class="leaderboard-tabs">
+            <div class="leaderboard-tab active" data-tab="score">ĐIỂM</div>
+            <div class="leaderboard-tab" data-tab="pvp">PK</div>
+          </div>
+          <div class="leaderboard-list" id="leaderboardList"></div>
+        </article>
+
+        <article class="panel right chat-panel" id="chatPanel">
+          <div class="chat-header" id="chatHeader">
+            <span>💬 CHAT THẾ GIỚI</span>
+            <button id="chatToggleButton" aria-label="Thu gọn chat">▼</button>
+          </div>
+          <div class="chat-body">
+            <div class="chat-history" id="chatHistory"></div>
+          </div>
+          <div class="chat-footer">
+            <input id="chatInput" type="text" placeholder="Gửi tin nhắn..." />
+            <button id="chatSendButton">GỬI</button>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <section id="pvpRoomScreen" class="screen hidden pvp-room-screen">
+      <div class="pvp-room-panel">
+        <h2>TÌM ĐỐI THỦ</h2>
+        <div class="pvp-subtitle">AI CHẾT TRƯỚC HOẶC XA ĐÍCH HƠN SẼ THUA</div>
+        <button id="createRoomButton" class="create-room-btn">+ TẠO PHÒNG MỚI</button>
+        <div class="waiting-list" id="waitingRoomList"></div>
+      </div>
+    </section>
+
+    <section id="gameScreen" class="screen hidden game-screen">
+      <canvas id="gameCanvas"></canvas>
+      <div class="hud-overlay" id="hudOverlay">Đang tìm trận...</div>
+      <div class="status-bar">
+        <div class="status-pill" id="statusPlayer">Người chơi: -</div>
+        <div class="status-pill" id="statusOpponent">Đối thủ: -</div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Socket.IO must load before main.js -->
+  <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+  <script src="main.js"></script>
+</body>
+</html>

@@ -1,0 +1,15 @@
+# Netlify configuration for proxying Socket.io to backend (Render)
+# Replace the placeholder with your actual Render backend URL (e.g. "https://your-backend.onrender.com").
+# The proxy ensures client requests to /socket.io/* are redirected to the socket server to avoid mixed-content
+# and allow the client to use same-origin socket URL (const socket = io(...)).
+
+[[redirects]]
+  from = "/socket.io/*"
+  to = "https://your-backend.onrender.com"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200

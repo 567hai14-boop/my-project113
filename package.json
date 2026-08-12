@@ -1,0 +1,16 @@
+{
+  "name": "maze-retro-server",
+  "version": "1.0.0",
+  "description": "Maze PK Retro - Socket.IO multiplayer backend and static client",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": "18.x"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "socket.io": "^4.7.2"
+  }
+}
