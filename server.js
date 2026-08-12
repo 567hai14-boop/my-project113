@@ -34,6 +34,13 @@ const broadcastLeaderboard = () => {
 
 const findUser = (username) => users.find((user) => user.username === username);
 
+// A player is "free" if they either don't have a roomId, or their roomId
+// points at a room that no longer exists (stale). Used to stop a player
+// from being dropped into a second match while still active in a first —
+// which used to leave the old room's bot/update intervals running forever
+// and left that socket receiving game_update from two rooms at once.
+const isPlayerFree = (player) => !!player && !(player.roomId && rooms[player.roomId]);
+
 const createPublicRoom = (hostName, hostId) => {
   const room = {
     roomId: hostId,
@@ -285,6 +292,23 @@ const getPlayerDistance = (player) => {
   return Math.sqrt(player.x * player.x + player.y * player.y);
 };
 
+// Turns the current chunk's randomly-picked farthest dead end into an
+// absolute world-pixel point, so the client can show it as a goal marker.
+// This is what farthestDeadEnds/exitX/exitY were computed for — previously
+// they were stored on the chunk but never actually reached the client.
+const getPlayerWaypoint = (player) => {
+  const tileX = Math.floor(player.x / TILE_SIZE);
+  const tileY = Math.floor(player.y / TILE_SIZE);
+  const chunkX = Math.floor(tileX / CHUNK_SIZE);
+  const chunkY = Math.floor(tileY / CHUNK_SIZE);
+  const chunk = generatedChunks[getChunkKey(chunkX, chunkY)];
+  if (!chunk) return null;
+  return {
+    x: (chunkX * CHUNK_SIZE + chunk.exitX) * TILE_SIZE + TILE_SIZE / 2,
+    y: (chunkY * CHUNK_SIZE + chunk.exitY) * TILE_SIZE + TILE_SIZE / 2,
+  };
+};
+
 const getNearbyTraps = (player) => {
   const tileX = Math.floor(player.x / TILE_SIZE);
   const tileY = Math.floor(player.y / TILE_SIZE);
@@ -491,6 +515,25 @@ const moveBotAlongPath = (room, target) => {
 // hasn't left enough of a trail yet (start of the run, or the bot just
 // switched target), we fall back to moveBotAlongPath's A* chase so the bot
 // isn't stuck standing still.
+// Finds the point in `trail` closest to (x, y) in world pixels. Used the
+// first time the bot ever targets a given player, so it starts following
+// their trail from wherever is physically nearest instead of all the way
+// back at their spawn point.
+const findNearestTrailIndex = (trail, x, y) => {
+  let bestIdx = 0;
+  let bestDistSq = Infinity;
+  for (let i = 0; i < trail.length; i += 1) {
+    const dx = trail[i].x * TILE_SIZE - x;
+    const dy = trail[i].y * TILE_SIZE - y;
+    const distSq = dx * dx + dy * dy;
+    if (distSq < bestDistSq) {
+      bestDistSq = distSq;
+      bestIdx = i;
+    }
+  }
+  return bestIdx;
+};
+
 const moveBotAlongPlayerTrail = (room, target) => {
   const bot = room.bot;
   const trail = target.trail || [];
@@ -501,7 +544,10 @@ const moveBotAlongPlayerTrail = (room, target) => {
   }
 
   if (!room.bot.followIndexByPlayer) room.bot.followIndexByPlayer = {};
-  let idx = room.bot.followIndexByPlayer[target.id] || 0;
+  let idx = room.bot.followIndexByPlayer[target.id];
+  if (idx === undefined) {
+    idx = findNearestTrailIndex(trail, bot.x, bot.y);
+  }
   if (idx >= trail.length) idx = trail.length - 1;
 
   const nextTile = trail[idx];
@@ -524,10 +570,20 @@ const moveBotAlongPlayerTrail = (room, target) => {
   room.bot.followIndexByPlayer[target.id] = idx;
 };
 
-// Bot speed ramp: +3% (compounding) every second the match has been live,
-// capped at 1.6x whatever the chased player's own current speed is.
-const BOT_SPEED_RAMP_PER_SECOND = 0.03;
-const BOT_MAX_SPEED_MULTIPLIER = 1.6;
+// Rebalanced from the previous pass: +3%/second compounding hit the 1.6x
+// speed cap after only ~20s, leaving 80% of a 2-minute match with no rising
+// tension. +0.4%/second reaches a gentler 1.45x cap around the ~90s mark
+// instead — pressure builds across most of the match and only maxes out
+// for a tense final stretch, rather than the bot going instantly deadly.
+const BOT_SPEED_RAMP_PER_SECOND = 0.004;
+const BOT_MAX_SPEED_MULTIPLIER = 1.45;
+
+// How much closer (in px) a different player has to be before the bot will
+// actually switch off its current target. Without this, two players at
+// near-equal distance made the bot flip targets almost every 100ms tick —
+// and since it now retraces trails instead of live-pathfinding, a flip
+// meant visibly jumping into a completely different corridor.
+const BOT_TARGET_SWITCH_MARGIN = TILE_SIZE * 4;
 
 const startRoomBotLoop = (roomId) => {
   if (!rooms[roomId]) return;
@@ -540,22 +596,33 @@ const startRoomBotLoop = (roomId) => {
     const activePlayers = room.players.map((id) => players[id]).filter(Boolean);
     if (!activePlayers.length) return;
 
-    let target = activePlayers[0];
-    let bestDist = Math.abs(room.bot.x - target.x) + Math.abs(room.bot.y - target.y);
+    let nearest = activePlayers[0];
+    let nearestDist = Math.abs(room.bot.x - nearest.x) + Math.abs(room.bot.y - nearest.y);
     for (let i = 1; i < activePlayers.length; i += 1) {
       const candidate = activePlayers[i];
       const d = Math.abs(room.bot.x - candidate.x) + Math.abs(room.bot.y - candidate.y);
-      if (d < bestDist) {
-        bestDist = d;
-        target = candidate;
+      if (d < nearestDist) {
+        nearestDist = d;
+        nearest = candidate;
       }
     }
+
+    let target = nearest;
+    if (room.bot.currentTargetId && room.bot.currentTargetId !== nearest.id) {
+      const current = activePlayers.find((p) => p.id === room.bot.currentTargetId);
+      if (current) {
+        const currentDist = Math.abs(room.bot.x - current.x) + Math.abs(room.bot.y - current.y);
+        if (currentDist - nearestDist < BOT_TARGET_SWITCH_MARGIN) {
+          target = current; // nearest isn't clearly closer enough to justify switching
+        }
+      }
+    }
+    room.bot.currentTargetId = target.id;
 
     // Bot speed ramps up by a fixed percentage every second the match has
     // been running (measured from when the countdown ended, not from room
     // creation, so waiting in the lobby/countdown never counts against the
-    // player). Compounding 1.03^seconds means: 1s -> +3%, 10s -> +34%,
-    // 30s -> +142%, capped so it can never wildly outrun the player.
+    // player), capped so it can never wildly outrun the player.
     const elapsed = Date.now() - (room.startedAt || room.createdAt);
     const secondsElapsed = Math.floor(elapsed / 1000);
     const maxSpeed = (target.speed || 4) * BOT_MAX_SPEED_MULTIPLIER;
@@ -650,6 +717,7 @@ const sendRoomGameUpdate = (roomId) => {
     player,
     traps: getNearbyTraps(player),
     chunks: getNearbyChunks(player),
+    waypoint: getPlayerWaypoint(player),
   }));
 
   if (!room.finished) {
@@ -687,7 +755,7 @@ const sendRoomGameUpdate = (roomId) => {
     }
   }
 
-  perPlayer.forEach(({ id, player, traps, chunks }) => {
+  perPlayer.forEach(({ id, player, traps, chunks, waypoint }) => {
     const opponentEntry = perPlayer.find((entry) => entry.id !== id);
     const update = {
       you: { x: player.x, y: player.y, distance: getPlayerDistance(player) },
@@ -697,6 +765,7 @@ const sendRoomGameUpdate = (roomId) => {
       bot: room.bot,
       traps,
       chunks,
+      waypoint,
     };
     const socket = io.sockets.sockets.get(id);
     if (socket) socket.emit('game_update', update);
@@ -743,10 +812,17 @@ const tryMatchQueue = () => {
     const playerIdB = matchmakingQueue.shift();
     const playerA = players[playerIdA];
     const playerB = players[playerIdB];
-    if (!playerA || !playerB) {
-      if (playerA) matchmakingQueue.unshift(playerIdA);
-      if (playerB) matchmakingQueue.unshift(playerIdB);
-      break;
+
+    const freeA = isPlayerFree(playerA);
+    const freeB = isPlayerFree(playerB);
+    if (!freeA || !freeB) {
+      // Whoever is still connected and free goes back to the front of the
+      // queue to wait for the next candidate; whoever is gone or already
+      // mid-match elsewhere is dropped instead of being force-matched.
+      if (freeA) matchmakingQueue.unshift(playerIdA);
+      if (freeB) matchmakingQueue.unshift(playerIdB);
+      if (!freeA && !freeB) continue; // both unusable — keep draining the queue
+      break; // one side is waiting on a fresh opponent
     }
 
     const roomId = `room_${Math.random().toString(36).substring(2, 10)}_${Date.now()}`;
@@ -869,6 +945,11 @@ io.on('connection', (socket) => {
     };
     players[socket.id].name = data.name || players[socket.id].name;
 
+    if (!isPlayerFree(players[socket.id])) {
+      socket.emit('find_match_failed', { message: 'Bạn đang trong một trận đấu khác.' });
+      return;
+    }
+
     for (let cx = -1; cx <= 1; cx += 1) {
       for (let cy = -1; cy <= 1; cy += 1) {
         addChunkIfMissing(cx, cy);
@@ -951,6 +1032,13 @@ io.on('connection', (socket) => {
     socket.emit('public_room_created', { activeRooms: publicRooms });
   });
 
+  // Player backed out of the "waiting for opponent" screen without ever
+  // getting matched — drop their public listing (if any) so it doesn't
+  // keep showing up to others as "waiting" forever.
+  socket.on('leave_public_room', () => {
+    removePublicRoomByHostId(socket.id);
+  });
+
   socket.on('join_public_room', (roomId) => {
     const publicRoom = resolvePublicRoom(roomId);
     if (!publicRoom || publicRoom.status !== 'waiting') {
@@ -970,6 +1058,18 @@ io.on('connection', (socket) => {
     const guestPlayer = players[guestSocketId];
     if (!hostPlayer || !guestPlayer) {
       socket.emit('join_public_room_failed', { message: 'Both players must be connected and ready.' });
+      return;
+    }
+
+    if (!isPlayerFree(hostPlayer)) {
+      // Host wandered into another match/run without properly leaving this
+      // listing — clean the stale listing up instead of double-booking them.
+      removePublicRoomByHostId(hostSocketId);
+      socket.emit('join_public_room_failed', { message: 'Chủ phòng đang trong một trận đấu khác.' });
+      return;
+    }
+    if (!isPlayerFree(guestPlayer)) {
+      socket.emit('join_public_room_failed', { message: 'Bạn đang trong một trận đấu khác.' });
       return;
     }
 
