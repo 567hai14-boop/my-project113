@@ -47,6 +47,7 @@
     bot: { x: 80, y: 320 },
     traps: [],
     chunks: [],
+    waypoint: null,
   };
 
   // Configs (must match server)
@@ -202,6 +203,15 @@
   pvpModeBtn.addEventListener('click', () => showScreen('pvpRoom'));
   createRoomButton.addEventListener('click', () => socket.emit('create_public_room'));
 
+  // Leaving the "waiting for opponent" screen without ever getting matched
+  // — drop our own public room listing (if we were hosting one) so it
+  // doesn't linger visible to others, then go back to the lobby.
+  const pvpBackButton = document.getElementById('pvpBackButton');
+  pvpBackButton.addEventListener('click', () => {
+    socket.emit('leave_public_room');
+    showScreen('lobby');
+  });
+
   // Socket handlers
   socket.on('user_login_success', (data) => {
     resetLoginUi();
@@ -222,6 +232,12 @@
   });
 
   socket.on('leaderboard_update', (leaderboard) => {
+    // Server sends the FULL sorted list (not just top 10) — look the
+    // player up in it before trimming for display, so their own win count
+    // on the lobby card refreshes even if they're not currently in the
+    // visible top 10 (previously this only ever got set once, at login).
+    const mine = leaderboard.find((entry) => entry.username === state.username);
+    if (mine) winCount.textContent = `${mine.wins} trận thắng`;
     state.leaderboard = leaderboard.slice(0, 10);
     renderLeaderboard();
   });
@@ -368,7 +384,7 @@
       // Cleanup: remove overlay, reset local game state, return to lobby safely
       overlay.remove();
       predicted = null;
-      gameState = { you: { x: 100, y: 100, distance: 0 }, opponent: { x: 220, y: 120, distance: 0 }, bot: { x: 80, y: 320 }, traps: [], chunks: [] };
+      gameState = { you: { x: 100, y: 100, distance: 0 }, opponent: { x: 220, y: 120, distance: 0 }, bot: { x: 80, y: 320 }, traps: [], chunks: [], waypoint: null };
       state.match = null;
       hudOverlay.textContent = '';
       showScreen('lobby');
@@ -593,6 +609,7 @@
     const camY = youPos ? youPos.y - height / 2 : 0;
 
     let botScreenPos = null; // filled inside the zoomed block, used by the fog/indicator below
+    let waypointScreenPos = null; // same, for the goal-marker edge arrow
 
     // Everything world-related is drawn inside this zoom transform, scaled
     // around the exact screen center — since the camera always keeps the
@@ -640,6 +657,30 @@
     sampleTrailIfFast();
     // Draw ghost trail behind player
     drawGhostTrail(camX, camY);
+
+    // Draw the current chunk's waypoint — a randomly-picked farthest dead
+    // end, meant as a "somewhere to head toward" landmark rather than a
+    // hard objective. Purely a visual guide.
+    if (gameState.waypoint) {
+      const wx = gameState.waypoint.x - camX;
+      const wy = gameState.waypoint.y - camY;
+      waypointScreenPos = { x: wx, y: wy };
+      ctx.save();
+      ctx.shadowBlur = 18;
+      ctx.shadowColor = '#8b7cf6';
+      ctx.strokeStyle = '#8b7cf6';
+      ctx.fillStyle = 'rgba(139,124,246,0.25)';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(wx, wy - 13);
+      ctx.lineTo(wx + 13, wy);
+      ctx.lineTo(wx, wy + 13);
+      ctx.lineTo(wx - 13, wy);
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+      ctx.restore();
+    }
 
     // Draw bot
     if (gameState.bot) {
@@ -732,6 +773,18 @@
         const distToBot = Math.hypot(realX - centerX, realY - centerY);
         if (distToBot > coreRadius * 0.9) {
           drawEdgeIndicator(centerX, centerY, realX, realY, width, height, '#ff3333');
+        }
+      }
+
+      // Same idea for the waypoint marker, in purple, so there's always a
+      // sense of "which way to explore" even once it scrolls out of the
+      // lit torch radius.
+      if (waypointScreenPos) {
+        const realX = width / 2 + (waypointScreenPos.x - width / 2) * ZOOM;
+        const realY = height / 2 + (waypointScreenPos.y - height / 2) * ZOOM;
+        const distToWaypoint = Math.hypot(realX - centerX, realY - centerY);
+        if (distToWaypoint > coreRadius * 0.9) {
+          drawEdgeIndicator(centerX, centerY, realX, realY, width, height, '#8b7cf6');
         }
       }
     }
