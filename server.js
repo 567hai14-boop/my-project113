@@ -1,4 +1,4 @@
-﻿const express = require('express');
+const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 
@@ -12,7 +12,7 @@ const io = new Server(server, {
 });
 
 const TILE_SIZE = 45;
-const CHUNK_SIZE = 10;
+const CHUNK_SIZE = 16; // bigger chunks = fewer, more varied regenerations, less "same layout" feeling
 const generatedChunks = {}; // Lưu map theo key "chunkX_chunkY"
 const players = {};
 const matchmakingQueue = [];
@@ -105,27 +105,38 @@ const generateChunk = (chunkX, chunkY) => {
   const distance = Math.sqrt(chunkX * chunkX + chunkY * chunkY);
   const openness = Math.min(0.7, 0.12 + distance * 0.04);
 
-  const midX = Math.floor(CHUNK_SIZE / 2);
-  const midY = Math.floor(CHUNK_SIZE / 2);
-  for (let x = 0; x < CHUNK_SIZE; x += 1) grid[midY][x] = 0;
-  for (let y = 0; y < CHUNK_SIZE; y += 1) grid[y][midX] = 0;
-
-  const branchCount = 4;
-  for (let branch = 0; branch < branchCount; branch += 1) {
-    let x = Math.floor(seededRandom(chunkX, chunkY, branch * 7) * CHUNK_SIZE);
-    let y = Math.floor(seededRandom(chunkX, chunkY, branch * 13) * CHUNK_SIZE);
-    const length = Math.max(6, Math.floor(5 + seededRandom(chunkX, chunkY, branch * 11) * 12));
+  // "Chuột đào hang": several random walkers dig winding tunnels through the
+  // chunk instead of one fixed mid-cross + straight branches, so chunks stop
+  // feeling like the same template repeating. Each walker avoids reversing
+  // on itself immediately (that's what made corridors feel like dead-end
+  // backtracks) and occasionally widens its tunnel by a tile.
+  const diggerCount = 6 + Math.floor(seededRandom(chunkX, chunkY, 3) * 4); // 6-9 diggers
+  for (let digger = 0; digger < diggerCount; digger += 1) {
+    let x = Math.floor(seededRandom(chunkX, chunkY, digger * 7 + 1) * CHUNK_SIZE);
+    let y = Math.floor(seededRandom(chunkX, chunkY, digger * 13 + 1) * CHUNK_SIZE);
+    const length = Math.max(10, Math.floor(14 + seededRandom(chunkX, chunkY, digger * 11 + 1) * 22));
+    let lastDir = -1;
+    const oppositeOf = { 0: 1, 1: 0, 2: 3, 3: 2 };
 
     for (let step = 0; step < length; step += 1) {
       grid[y][x] = 0;
-      const direction = Math.floor(seededRandom(chunkX, chunkY, branch * 23 + step) * 4);
+      // widen some tunnels so they don't all read as identical 1-tile corridors
+      if (seededRandom(chunkX + x, chunkY + y, digger * 5 + step) < 0.3) {
+        if (x + 1 < CHUNK_SIZE) grid[y][x + 1] = 0;
+        if (y + 1 < CHUNK_SIZE) grid[y + 1][x] = 0;
+      }
+
+      let direction = Math.floor(seededRandom(chunkX, chunkY, digger * 23 + step * 3) * 4);
+      if (direction === oppositeOf[lastDir] && seededRandom(chunkX, chunkY, digger * 29 + step) < 0.8) {
+        direction = (direction + 1) % 4;
+      }
+      lastDir = direction;
+
       if (direction === 0 && x < CHUNK_SIZE - 1) x += 1;
       else if (direction === 1 && x > 0) x -= 1;
       else if (direction === 2 && y < CHUNK_SIZE - 1) y += 1;
       else if (direction === 3 && y > 0) y -= 1;
-      if (seededRandom(chunkX, chunkY, branch * 29 + step) < openness) {
-        grid[y][x] = 0;
-      }
+      grid[y][x] = 0;
     }
   }
 
@@ -177,6 +188,29 @@ const generateChunk = (chunkX, chunkY) => {
             const absY = (chunkY * CHUNK_SIZE + y) * TILE_SIZE;
             traps.push({ x: absX, y: absY });
           }
+        }
+      }
+    }
+  }
+
+  // Braid pass: any path tile with exactly one open neighbour is a dead
+  // end. Carve one more neighbour open so exploring doesn't constantly run
+  // into cul-de-sacs — this is what makes the tunnels feel connected rather
+  // than a maze of isolated pockets.
+  for (let y = 1; y < CHUNK_SIZE - 1; y += 1) {
+    for (let x = 1; x < CHUNK_SIZE - 1; x += 1) {
+      if (grid[y][x] !== 0) continue;
+      const openNeighbors = [
+        [x + 1, y], [x - 1, y], [x, y + 1], [x, y - 1],
+      ].filter(([nx, ny]) => grid[ny][nx] === 0);
+      if (openNeighbors.length === 1 && seededRandom(chunkX + x, chunkY + y, 77) < 0.7) {
+        const candidates = [
+          [x + 1, y], [x - 1, y], [x, y + 1], [x, y - 1],
+        ].filter(([nx, ny]) => nx > 0 && nx < CHUNK_SIZE - 1 && ny > 0 && ny < CHUNK_SIZE - 1);
+        if (candidates.length) {
+          const pickIndex = Math.floor(seededRandom(chunkX + x, chunkY + y, 83) * candidates.length);
+          const [px, py] = candidates[pickIndex];
+          grid[py][px] = 0;
         }
       }
     }
@@ -429,7 +463,59 @@ const clearRoomIntervals = (roomId) => {
   if (roomIntervals[roomId].countdown) clearInterval(roomIntervals[roomId].countdown);
   if (roomIntervals[roomId].update) clearInterval(roomIntervals[roomId].update);
   if (roomIntervals[roomId].bot) clearInterval(roomIntervals[roomId].bot);
+  if (roomIntervals[roomId].matchTimeout) clearTimeout(roomIntervals[roomId].matchTimeout);
   delete roomIntervals[roomId];
+};
+
+const MATCH_TIME_LIMIT_MS = 120000; // 2 minutes, PvP (2-player) rooms only
+
+// When time runs out in a PvP match, whoever has covered less distance loses
+// (matches the "AI CHẾT TRƯỚC HOẶC XA ĐÍCH HƠN SẼ THUA" rule). Re-uses the
+// same player_died flow the death-by-collision path uses, so the client
+// needs no new event listener.
+const startMatchTimer = (roomId) => {
+  if (!rooms[roomId]) return;
+  roomIntervals[roomId] = roomIntervals[roomId] || {};
+  if (roomIntervals[roomId].matchTimeout) return;
+
+  roomIntervals[roomId].matchTimeout = setTimeout(() => {
+    const room = rooms[roomId];
+    if (!room || room.finished) return;
+    const entries = room.players
+      .map((id) => ({ id, player: players[id] }))
+      .filter((entry) => entry.player);
+    if (entries.length < 2) return; // solo runs don't time out this way
+
+    entries.sort((a, b) => (a.player.distance || 0) - (b.player.distance || 0));
+    const loser = entries[0];
+    const winnerEntry = entries[entries.length - 1];
+
+    room.finished = true;
+    io.to(roomId).emit('player_died', {
+      loserId: loser.id,
+      finalTime: Date.now() - (room.startedAt || Date.now()),
+      reason: 'time_up',
+    });
+
+    try {
+      const winnerPlayer = winnerEntry && winnerEntry.player;
+      if (winnerPlayer && winnerPlayer.name) {
+        const userRecord = users.find((u) => u.username === winnerPlayer.name);
+        if (userRecord) userRecord.wins = (userRecord.wins || 0) + 1;
+      }
+    } catch (err) {
+      // ignore
+    }
+
+    broadcastLeaderboard();
+    clearRoomIntervals(roomId);
+    room.players.forEach((pid) => {
+      if (players[pid]) players[pid].roomId = null;
+    });
+    setTimeout(() => {
+      delete rooms[roomId];
+    }, 250);
+  }, MATCH_TIME_LIMIT_MS);
 };
 
 const sendRoomGameUpdate = (roomId) => {
@@ -521,6 +607,7 @@ const startRoomUpdates = (roomId) => {
 const startRoomCountdown = (roomId) => {
   if (!rooms[roomId]) return;
   clearRoomIntervals(roomId);
+  rooms[roomId].countdownActive = true; // player_move ignores input while this is true
   roomIntervals[roomId] = roomIntervals[roomId] || {};
   let count = 3;
   roomIntervals[roomId].countdown = setInterval(() => {
@@ -529,7 +616,11 @@ const startRoomCountdown = (roomId) => {
       clearInterval(roomIntervals[roomId].countdown);
       roomIntervals[roomId].countdown = null;
       const room = rooms[roomId];
-      if (room) room.startedAt = Date.now();
+      if (room) {
+        room.startedAt = Date.now();
+        room.countdownActive = false;
+        if (room.players.length === 2) startMatchTimer(roomId);
+      }
       startRoomUpdates(roomId);
       startRoomBotLoop(roomId);
       return;
@@ -574,11 +665,13 @@ const tryMatchQueue = () => {
       roomId,
       seed: rooms[roomId].seed,
       opponent: playerB.name || `Player_${playerIdB.slice(-4)}`,
+      timeLimitMs: MATCH_TIME_LIMIT_MS,
     };
     const payloadB = {
       roomId,
       seed: rooms[roomId].seed,
       opponent: playerA.name || `Player_${playerIdA.slice(-4)}`,
+      timeLimitMs: MATCH_TIME_LIMIT_MS,
     };
     if (socketA) socketA.emit('match_start', payloadA);
     if (socketB) socketB.emit('match_start', payloadB);
@@ -756,6 +849,12 @@ io.on('connection', (socket) => {
 
     const hostSocketId = publicRoom.roomId;
     const guestSocketId = socket.id;
+
+    if (guestSocketId === hostSocketId) {
+      socket.emit('join_public_room_failed', { message: 'Không thể tự vào phòng của chính bạn.' });
+      return;
+    }
+
     const hostPlayer = players[hostSocketId];
     const guestPlayer = players[guestSocketId];
     if (!hostPlayer || !guestPlayer) {
@@ -790,11 +889,13 @@ io.on('connection', (socket) => {
       roomId: matchRoomId,
       seed: rooms[matchRoomId].seed,
       opponent: guestPlayer.name || `Player_${guestSocketId.slice(-4)}`,
+      timeLimitMs: MATCH_TIME_LIMIT_MS,
     };
     const payloadGuest = {
       roomId: matchRoomId,
       seed: rooms[matchRoomId].seed,
       opponent: hostPlayer.name || `Player_${hostSocketId.slice(-4)}`,
+      timeLimitMs: MATCH_TIME_LIMIT_MS,
     };
     if (socketHost) socketHost.emit('match_start', payloadHost);
     if (socketGuest) socketGuest.emit('match_start', payloadGuest);
@@ -805,6 +906,11 @@ io.on('connection', (socket) => {
   socket.on('player_move', (dir) => {
     const player = players[socket.id];
     if (!player) return;
+
+    // Frozen during the pre-match countdown — this is the authoritative
+    // check; the client also avoids sending input during this window, but
+    // we don't trust that alone.
+    if (player.roomId && rooms[player.roomId] && rooms[player.roomId].countdownActive) return;
 
     let nextX = player.x;
     let nextY = player.y;
