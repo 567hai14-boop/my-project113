@@ -102,6 +102,22 @@ const createEmptyGrid = () => Array.from({ length: CHUNK_SIZE }, () => Array(CHU
 // extra cross-chunk bookkeeping needed.
 const CELLS_PER_SIDE = Math.floor((CHUNK_SIZE - 1) / 2) + 1; // e.g. 16 for size 31
 
+// carveSpanningTree() only ever opens EVEN/EVEN grid coordinates (the cells)
+// plus the even/odd or odd/even coordinates directly between two carved
+// cells. An odd/odd coordinate (a "corner" between four cells) is never
+// part of that pattern, so it is permanently a wall (1) no matter what.
+// The old spawn point — (CHUNK_SIZE*TILE_SIZE)/2 — landed on tile (15,15),
+// which is odd/odd, so every player spawned embedded in solid wall and
+// could never move a single pixel (movement always checks the destination
+// tile, and that tile stayed the same, always-blocked one). Spawn on a
+// picked even/even cell near the middle of the chunk instead — the
+// spanning tree is a full spanning tree over every cell, so this is
+// guaranteed open.
+const SPAWN_CELL = Math.floor(CELLS_PER_SIDE / 2); // 8, for CELLS_PER_SIDE=16
+const SPAWN_TILE = SPAWN_CELL * 2; // 16 — guaranteed grid[16][16] === 0
+const SPAWN_X = SPAWN_TILE * TILE_SIZE + TILE_SIZE / 2;
+const SPAWN_Y = SPAWN_TILE * TILE_SIZE + TILE_SIZE / 2;
+
 // Builds a perfect maze (randomized-DFS spanning tree) over the cell grid.
 // A spanning tree touches every single cell exactly once, so by
 // construction there is no unreachable pocket — "không tịt đường" is
@@ -900,8 +916,8 @@ io.on('connection', (socket) => {
     if (player.roomId && rooms[player.roomId]) return; // already in a run
 
     // Fresh spawn for this run
-    player.x = (CHUNK_SIZE * TILE_SIZE) / 2;
-    player.y = (CHUNK_SIZE * TILE_SIZE) / 2;
+    player.x = SPAWN_X;
+    player.y = SPAWN_Y;
     player.distance = 0;
     player.trail = []; // fresh spawn — old trail would point at the previous run's maze
 
@@ -936,8 +952,8 @@ io.on('connection', (socket) => {
     players[socket.id] = players[socket.id] || {
       id: socket.id,
       name: data.name || `Player_${socket.id.slice(-4)}`,
-      x: (CHUNK_SIZE * TILE_SIZE) / 2,
-      y: (CHUNK_SIZE * TILE_SIZE) / 2,
+      x: SPAWN_X,
+      y: SPAWN_Y,
       speed: 4,
       distance: 0,
       roomId: null,
@@ -989,8 +1005,8 @@ io.on('connection', (socket) => {
     players[socket.id] = players[socket.id] || {
       id: socket.id,
       name: data.username,
-      x: (CHUNK_SIZE * TILE_SIZE) / 2,
-      y: (CHUNK_SIZE * TILE_SIZE) / 2,
+      x: SPAWN_X,
+      y: SPAWN_Y,
       speed: 4,
       distance: 0,
       roomId: null,
