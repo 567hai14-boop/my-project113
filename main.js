@@ -28,6 +28,20 @@
   const canvas = document.getElementById('gameCanvas');
   const ctx = canvas.getContext('2d');
 
+  // Defensive helper: if index.html and main.js ever drift out of sync
+  // (an id renamed/removed on one side but not the other), a plain
+  // el.addEventListener() throws and — because this whole file is one
+  // synchronous IIFE — kills every line after it, including all the
+  // socket.on(...) handlers further down. That silently breaks login
+  // even though the server answered fine, since nothing is left to
+  // receive user_login_success/user_login_failed. Using this wrapper
+  // instead means a single missing element just gets skipped (with a
+  // console warning) and the rest of the app keeps working.
+  const on = (el, evt, handler, opts) => {
+    if (!el) { console.warn(`[main.js] Missing element for "${evt}" listener — skipping.`); return; }
+    el.addEventListener(evt, handler, opts);
+  };
+
   // State
   const state = {
     username: null,
@@ -144,7 +158,7 @@
     loginButton.disabled = false;
   };
 
-  loginButton.addEventListener('click', () => {
+  on(loginButton, 'click', () => {
     const username = usernameInput.value.trim();
     const password = passwordInput.value.trim();
     if (!username || !password) {
@@ -185,8 +199,8 @@
     chatInput.value = '';
     chatInput.focus();
   };
-  chatSendButton.addEventListener('click', sendChat);
-  chatInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') sendChat(); });
+  on(chatSendButton, 'click', sendChat);
+  on(chatInput, 'keydown', (e) => { if (e.key === 'Enter') sendChat(); });
   document.querySelectorAll('.leaderboard-tab').forEach((tab) => {
     tab.addEventListener('click', () => {
       document.querySelectorAll('.leaderboard-tab').forEach((n) => n.classList.remove('active'));
@@ -195,19 +209,19 @@
     });
   });
 
-  singleModeBtn.addEventListener('click', () => {
+  on(singleModeBtn, 'click', () => {
     if (!state.username) return;
     hudOverlay.textContent = 'Đang tạo phòng luyện tập...';
     socket.emit('start_single_run');
   });
-  pvpModeBtn.addEventListener('click', () => showScreen('pvpRoom'));
-  createRoomButton.addEventListener('click', () => socket.emit('create_public_room'));
+  on(pvpModeBtn, 'click', () => showScreen('pvpRoom'));
+  on(createRoomButton, 'click', () => socket.emit('create_public_room'));
 
   // Leaving the "waiting for opponent" screen without ever getting matched
   // — drop our own public room listing (if we were hosting one) so it
   // doesn't linger visible to others, then go back to the lobby.
   const pvpBackButton = document.getElementById('pvpBackButton');
-  pvpBackButton.addEventListener('click', () => {
+  on(pvpBackButton, 'click', () => {
     socket.emit('leave_public_room');
     showScreen('lobby');
   });
@@ -418,11 +432,11 @@
     W: 'up', S: 'down', A: 'left', D: 'right'
   };
 
-  window.addEventListener('keydown', (e) => {
+  on(window, 'keydown', (e) => {
     const m = keyMap[e.key];
     if (m) { keysPressed[m] = true; e.preventDefault(); }
   });
-  window.addEventListener('keyup', (e) => {
+  on(window, 'keyup', (e) => {
     const m = keyMap[e.key];
     if (m) { keysPressed[m] = false; e.preventDefault(); }
   });
@@ -436,12 +450,12 @@
   // Touch swipe
   let touchStartX = 0, touchStartY = 0;
   const SWIPE_THRESHOLD = 35;
-  canvas.addEventListener('touchstart', (ev) => {
+  on(canvas, 'touchstart', (ev) => {
     const t = ev.touches[0];
     touchStartX = t.clientX; touchStartY = t.clientY;
   }, { passive: true });
 
-  canvas.addEventListener('touchend', (ev) => {
+  on(canvas, 'touchend', (ev) => {
     if (inputLocked) return;
     const t = ev.changedTouches[0];
     const dx = t.clientX - touchStartX;
@@ -462,7 +476,7 @@
   const chatPanel = document.getElementById('chatPanel');
   const chatHeader = document.getElementById('chatHeader');
   const chatToggleButton = document.getElementById('chatToggleButton');
-  chatHeader.addEventListener('click', () => {
+  on(chatHeader, 'click', () => {
     state.chatCollapsed = !state.chatCollapsed;
     if (state.chatCollapsed) { chatPanel.classList.add('chat-collapsed'); chatToggleButton.textContent = '▲'; }
     else { chatPanel.classList.remove('chat-collapsed'); chatToggleButton.textContent = '▼'; }
@@ -480,7 +494,7 @@
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   }
   resizeCanvas();
-  window.addEventListener('resize', resizeCanvas);
+  on(window, 'resize', resizeCanvas);
 
   // Ghost trail - last 3 points
   const ghostTrail = []; // [{x,y,alpha,size}]
